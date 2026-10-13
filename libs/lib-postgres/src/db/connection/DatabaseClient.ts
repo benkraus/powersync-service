@@ -40,7 +40,8 @@ export class DatabaseClient extends AbstractPostgresConnection<DatabaseClientLis
 
   protected connections: ConnectionSlot[];
 
-  protected initialized: Promise<void>;
+  /** The schema check in flight or done; cleared on failure so the next use runs it again. */
+  protected initializing: Promise<void> | null;
   protected queue: PromiseWithResolvers<ConnectionLease>[];
   /** Latest exhausted connection attempt for each slot in the current attempt round. */
   protected failedConnectionSlots: Map<ConnectionSlot, unknown>;
@@ -69,7 +70,17 @@ export class DatabaseClient extends AbstractPostgresConnection<DatabaseClientLis
       return slot;
     });
     this.queue = [];
-    this.initialized = this.initialize();
+    // Deferred to first use: a caller that blocks the event loop right after construction
+    // would otherwise stall this connection's setup, and Postgres proxies drop stalled setups.
+    this.initializing = null;
+  }
+
+  protected ensureInitialized(): Promise<void> {
+    this.initializing ??= this.initialize().catch((error) => {
+      this.initializing = null;
+      throw error;
+    });
+    return this.initializing;
   }
 
   protected get baseConnection() {
@@ -107,7 +118,7 @@ export class DatabaseClient extends AbstractPostgresConnection<DatabaseClientLis
   query(script: string, options?: pgwire.PgSimpleQueryOptions): Promise<pgwire.PgResult>;
   query(...args: pgwire.Statement[]): Promise<pgwire.PgResult>;
   async query(...args: any[]): Promise<pgwire.PgResult> {
-    await this.initialized;
+    await this.ensureInitialized();
     /**
      * There is no direct way to set the default schema with pgwire.
      * This hack uses multiple statements in order to always ensure the
@@ -126,7 +137,7 @@ export class DatabaseClient extends AbstractPostgresConnection<DatabaseClientLis
   }
 
   async *stream(...args: pgwire.Statement[]): AsyncIterableIterator<pgwire.PgChunk> {
-    await this.initialized;
+    await this.ensureInitialized();
     const { schemaStatement } = this;
     if (schemaStatement) {
       args.unshift(schemaStatement);
@@ -175,20 +186,23 @@ export class DatabaseClient extends AbstractPostgresConnection<DatabaseClientLis
     const { schema } = this.options;
     if (schema) {
       // First check if it exists
-      const exists = await this.pool.query(sql`
-        SELECT
-          schema_name
-        FROM
-          information_schema.schemata
-        WHERE
-          schema_name = ${{ type: 'varchar', value: schema }};
-      `);
+      const exists = await lib_postgres.retriedQuery(
+        this.pool,
+        sql`
+          SELECT
+            schema_name
+          FROM
+            information_schema.schemata
+          WHERE
+            schema_name = ${{ type: 'varchar', value: schema }};
+        `
+      );
 
       if (exists.rows.length) {
         return;
       }
       // Create the schema if it doesn't exist
-      await this.pool.query({ statement: `CREATE SCHEMA IF NOT EXISTS ${this.options.schema}` });
+      await lib_postgres.retriedQuery(this.pool, { statement: `CREATE SCHEMA IF NOT EXISTS ${this.options.schema}` });
     }
   }
 
@@ -197,7 +211,7 @@ export class DatabaseClient extends AbstractPostgresConnection<DatabaseClientLis
       throw new Error('Database client is closed');
     }
 
-    await this.initialized;
+    await this.ensureInitialized();
 
     // Queue the operation
     const deferred = Promise.withResolvers<ConnectionLease>();
@@ -282,7 +296,7 @@ export class DatabaseClient extends AbstractPostgresConnection<DatabaseClientLis
 
   async [Symbol.asyncDispose]() {
     try {
-      await this.initialized;
+      await this.initializing;
     } catch (e) {
       // Error was already reported when initializing - ignore here.
       // If if throw this, we typically get a SuppressedError, which is difficult to debug.
