@@ -122,6 +122,17 @@ describe('storage connection setup', () => {
     expect(await selectOne(factory)).toEqual([1n]);
   });
 
+  test('recovers when a stall drops a storage query that was already connecting', async () => {
+    // Real time on purpose: the stall has to outlast a deadline running in another thread.
+    await using proxy = await startProxy({ latencyMs: 100, deadlineMs: 300, dropFirst: 0 });
+    await using factory = storageFactory(proxy.uri);
+    const pending = selectOne(factory);
+    await sleep(20);
+    blockEventLoop(800);
+
+    expect(await pending).toEqual([1n]);
+  });
+
   test('a failed connection check does not fail every later query', async () => {
     await using proxy = await startProxy({ latencyMs: 0, deadlineMs: 5_000, dropFirst: 2 });
     await using factory = storageFactory(proxy.uri);
